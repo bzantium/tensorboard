@@ -23,6 +23,7 @@ import os
 import numpy as np
 import tensorflow as tf
 import unittest
+from unittest import mock
 
 from werkzeug import test as werkzeug_test
 from werkzeug import wrappers
@@ -273,6 +274,30 @@ class ProjectorAppTest(tf.test.TestCase):
         # it is active (because it might now be active even though it had not been
         # beforehand), so the mock should now be called twice.
         self.assertEqual(2, mock.call_count)
+
+    def testUnsupportedFilesystemDisablesProjector(self):
+        run = mock.Mock(run_name="run1")
+        provider = mock.Mock()
+        provider.list_runs.return_value = [run]
+        context = base_plugin.TBContext(
+            logdir="gs://bucket/logdir", data_provider=provider
+        )
+        self.plugin = projector_plugin.ProjectorPlugin(context)
+
+        with mock.patch.object(
+            projector_plugin.plugin_asset_util, "ListAssets", return_value=[]
+        ), mock.patch.object(
+            projector_plugin.tf.io.gfile,
+            "exists",
+            side_effect=ValueError(
+                "No recognized filesystem for prefix gs"
+            ),
+        ):
+            self.plugin._update_configs()
+
+        self.assertEqual({}, self.plugin._configs)
+        self.assertEqual({}, self.plugin.config_fpaths)
+        self.assertFalse(self.plugin._is_active)
 
     def _SetupWSGIApp(self):
         logdir = self.log_dir

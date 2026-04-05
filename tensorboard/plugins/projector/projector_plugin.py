@@ -221,6 +221,12 @@ def _using_tf():
     return tf.__version__ != "stub"
 
 
+def _is_unsupported_filesystem_error(exception):
+    return isinstance(exception, ValueError) and str(exception).startswith(
+        "No recognized filesystem for prefix "
+    )
+
+
 class ProjectorPlugin(base_plugin.TBPlugin):
     """Embedding projector."""
 
@@ -319,41 +325,62 @@ class ProjectorPlugin(base_plugin.TBPlugin):
         offer an immediate response to whether it is active and
         determine whether it should be active in a separate thread.
         """
-        self._update_configs()
-        if self._configs:
-            self._is_active = True
-        self._thread_for_determining_is_active = None
+        try:
+            self._update_configs()
+            if self._configs:
+                self._is_active = True
+        except Exception:
+            logger.exception(
+                "Projector plugin failed while determining active state."
+            )
+        finally:
+            self._thread_for_determining_is_active = None
 
     def _update_configs(self):
         """Updates `self._configs` and `self._run_paths`."""
-        if self.data_provider and self.logdir:
-            # Create a background context; we may not be in a request.
-            ctx = context.RequestContext()
-            run_paths = {
-                run.run_name: os.path.join(self.logdir, run.run_name)
-                for run in self.data_provider.list_runs(ctx, experiment_id="")
-            }
-        else:
-            run_paths = {}
-        run_paths_changed = run_paths != self._run_paths
-        self._run_paths = run_paths
+        try:
+            if self.data_provider and self.logdir:
+                # Create a background context; we may not be in a request.
+                ctx = context.RequestContext()
+                run_paths = {
+                    run.run_name: os.path.join(self.logdir, run.run_name)
+                    for run in self.data_provider.list_runs(
+                        ctx, experiment_id=""
+                    )
+                }
+            else:
+                run_paths = {}
+            run_paths_changed = run_paths != self._run_paths
+            self._run_paths = run_paths
 
-        run_path_pairs = list(self._run_paths.items())
-        self._append_plugin_asset_directories(run_path_pairs)
-        # Also accept the root logdir as a model checkpoint directory,
-        # so that the projector still works when there are no runs.
-        # (Case on `run` rather than `path` to avoid issues with
-        # absolute/relative paths on any filesystems.)
-        if "." not in self._run_paths:
-            run_path_pairs.append((".", self.logdir))
-        if run_paths_changed or _latest_checkpoints_changed(
-            self._configs, run_path_pairs
-        ):
-            self.readers = {}
-            self._configs, self.config_fpaths = self._read_latest_config_files(
-                run_path_pairs
+            run_path_pairs = list(self._run_paths.items())
+            self._append_plugin_asset_directories(run_path_pairs)
+            # Also accept the root logdir as a model checkpoint directory,
+            # so that the projector still works when there are no runs.
+            # (Case on `run` rather than `path` to avoid issues with
+            # absolute/relative paths on any filesystems.)
+            if "." not in self._run_paths:
+                run_path_pairs.append((".", self.logdir))
+            if run_paths_changed or _latest_checkpoints_changed(
+                self._configs, run_path_pairs
+            ):
+                self.readers = {}
+                self._configs, self.config_fpaths = (
+                    self._read_latest_config_files(run_path_pairs)
+                )
+                self._augment_configs_with_checkpoint_info()
+        except ValueError as e:
+            if not _is_unsupported_filesystem_error(e):
+                raise
+            logger.warning(
+                "Projector plugin disabled for unsupported filesystem in "
+                "logdir %r: %s",
+                self.logdir,
+                e,
             )
-            self._augment_configs_with_checkpoint_info()
+            self.readers = {}
+            self._configs = {}
+            self.config_fpaths = {}
 
     def _augment_configs_with_checkpoint_info(self):
         for run, config in self._configs.items():
