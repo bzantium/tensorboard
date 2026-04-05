@@ -40,7 +40,8 @@ tensorboard = "tensorboard.main:run_main"
 projector = "tensorboard.plugins.projector.projector_plugin:ProjectorPlugin"
 
 [project.optional-dependencies]
-tensorflow = ["tf-nightly"]
+# Source-checkout runs import `bleach` directly; release wheels vendor it.
+tensorflow = ["tf-nightly", "bleach"]
 
 [tool.setuptools.dynamic]
 version = {attr = "tensorboard.version.VERSION"}

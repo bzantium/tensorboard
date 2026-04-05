@@ -20,6 +20,9 @@ absl-py >= 0.4
 grpcio >= 1.48.2
 markdown >= 2.6.8
 numpy >= 1.12.0
+# The release wheel vendors bleach, but source-checkout installs import it
+# directly via tensorboard.plugin_util.
+bleach
 # NOTE: The packaging dependency was introduced in order to compare installed
 # package versions and conditionally use different supported kwargs
 # (specifically the protobuf dependency). If we restrict protobuf >= 5.0.0 we
