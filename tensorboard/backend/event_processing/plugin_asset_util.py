@@ -22,6 +22,12 @@ from tensorboard.compat import tf
 _PLUGINS_DIR = "plugins"
 
 
+def _IsUnsupportedFilesystemError(exception):
+    return isinstance(exception, ValueError) and str(exception).startswith(
+        "No recognized filesystem for prefix "
+    )
+
+
 def _IsDirectory(parent, item):
     """Helper that returns if parent/item is a directory."""
     return tf.io.gfile.isdir(os.path.join(parent, item))
@@ -49,6 +55,10 @@ def ListPlugins(logdir):
         entries = tf.io.gfile.listdir(plugins_dir)
     except tf.errors.NotFoundError:
         return []
+    except ValueError as e:
+        if _IsUnsupportedFilesystemError(e):
+            return []
+        raise
     # Strip trailing slashes, which listdir() includes for some filesystems
     # for subdirectories, after using them to bypass IsDirectory().
     return [
@@ -76,6 +86,10 @@ def ListAssets(logdir, plugin_name):
         return [x.rstrip("/") for x in tf.io.gfile.listdir(plugin_dir)]
     except tf.errors.NotFoundError:
         return []
+    except ValueError as e:
+        if _IsUnsupportedFilesystemError(e):
+            return []
+        raise
 
 
 def RetrieveAsset(logdir, plugin_name, asset_name):
@@ -103,3 +117,7 @@ def RetrieveAsset(logdir, plugin_name, asset_name):
         raise KeyError(
             "Couldn't read asset path: %s, OpError %s" % (asset_path, e)
         )
+    except ValueError as e:
+        if _IsUnsupportedFilesystemError(e):
+            raise KeyError("Asset path %s not found" % asset_path)
+        raise

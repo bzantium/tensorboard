@@ -358,6 +358,16 @@ py_library(
     ],
 )
 
+py_test(
+    name = "plugin_asset_util_test",
+    size = "small",
+    srcs = ["plugin_asset_util_test.py"],
+    srcs_version = "PY3",
+    deps = [
+        ":plugin_asset_util",
+    ],
+)
+
 py_library(
     name = "event_file_inspector",
     srcs = ["event_file_inspector.py"],
