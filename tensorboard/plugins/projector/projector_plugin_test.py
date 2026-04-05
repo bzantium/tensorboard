@@ -298,6 +298,43 @@ class ProjectorAppTest(tf.test.TestCase):
         self.assertEqual({}, self.plugin._configs)
         self.assertEqual({}, self.plugin.config_fpaths)
         self.assertFalse(self.plugin._is_active)
+        self.assertTrue(self.plugin._inactive_due_to_unsupported_filesystem)
+
+    def testUnsupportedFilesystemDoesNotRetryOrRelog(self):
+        run = mock.Mock(run_name="run1")
+        provider = mock.Mock()
+        provider.list_runs.return_value = [run]
+        context = base_plugin.TBContext(
+            logdir="gs://bucket/logdir", data_provider=provider
+        )
+        self.plugin = projector_plugin.ProjectorPlugin(context)
+
+        patcher = tf.compat.v1.test.mock.patch(
+            "threading.Thread.start", autospec=True
+        )
+        start_mock = patcher.start()
+        self.addCleanup(patcher.stop)
+
+        with mock.patch.object(
+            projector_plugin.plugin_asset_util, "ListAssets", return_value=[]
+        ), mock.patch.object(
+            projector_plugin.tf.io.gfile,
+            "exists",
+            side_effect=ValueError(
+                "No recognized filesystem for prefix gs"
+            ),
+        ), mock.patch.object(projector_plugin.logger, "warning") as warning_mock:
+            self.assertFalse(self.plugin.is_active())
+            thread = self.plugin._thread_for_determining_is_active
+            start_mock.assert_called_once_with(thread)
+
+            thread.run()
+
+            self.assertFalse(self.plugin.is_active())
+            self.plugin._update_configs()
+
+        start_mock.assert_called_once_with(thread)
+        warning_mock.assert_called_once()
 
     def _SetupWSGIApp(self):
         logdir = self.log_dir

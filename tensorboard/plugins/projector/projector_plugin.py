@@ -250,6 +250,7 @@ class ProjectorPlugin(base_plugin.TBPlugin):
         # Once the plugin is deemed active, we no longer re-compute the value
         # because doing so is potentially expensive.
         self._is_active = False
+        self._inactive_due_to_unsupported_filesystem = False
 
         # The running thread that is currently determining whether the plugin is
         # active. If such a thread exists, do not start a duplicate thread.
@@ -288,6 +289,9 @@ class ProjectorPlugin(base_plugin.TBPlugin):
           Whether any run has embedding data to show in the projector.
         """
         if not self.data_provider or not self.logdir:
+            return False
+
+        if self._inactive_due_to_unsupported_filesystem:
             return False
 
         if self._is_active:
@@ -338,6 +342,9 @@ class ProjectorPlugin(base_plugin.TBPlugin):
 
     def _update_configs(self):
         """Updates `self._configs` and `self._run_paths`."""
+        if self._inactive_due_to_unsupported_filesystem:
+            return
+
         try:
             if self.data_provider and self.logdir:
                 # Create a background context; we may not be in a request.
@@ -372,6 +379,7 @@ class ProjectorPlugin(base_plugin.TBPlugin):
         except ValueError as e:
             if not _is_unsupported_filesystem_error(e):
                 raise
+            self._inactive_due_to_unsupported_filesystem = True
             logger.warning(
                 "Projector plugin disabled for unsupported filesystem in "
                 "logdir %r: %s",
