@@ -15,7 +15,7 @@ limitations under the License.
 
 //! Loader for many runs under a directory.
 
-use log::warn;
+use log::{info, warn};
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 use std::collections::HashMap;
 use std::io::{self, Read};
@@ -78,6 +78,10 @@ pub struct LogdirLoader<'a, L: Logdir> {
     checksum: bool,
     /// A map defining how many samples per plugin to keep.
     plugin_sampling_hint: Arc<PluginSamplingHint>,
+    /// The most recent discovery error, if discovery is currently failing.
+    last_discover_error: Option<String>,
+    /// Number of consecutive discovery failures since the last success.
+    consecutive_discover_failures: usize,
 }
 
 type Discoveries = HashMap<Run, Vec<EventFileBuf>>;
@@ -115,6 +119,8 @@ where
             runs: HashMap::new(),
             checksum: true,
             plugin_sampling_hint,
+            last_discover_error: None,
+            consecutive_discover_failures: 0,
         }
     }
 
@@ -139,11 +145,26 @@ where
     }
 
     /// Finds all event files under the log directory and groups them by run.
-    fn discover(&self) -> Option<Discoveries> {
+    fn discover(&mut self) -> Option<Discoveries> {
         match self.logdir.discover() {
-            Ok(discoveries) => Some(discoveries),
+            Ok(discoveries) => {
+                if let Some(last_error) = self.last_discover_error.take() {
+                    let consecutive_failures = self.consecutive_discover_failures;
+                    info!(
+                        "Recovered log directory access after {} consecutive failure(s); last error: {}",
+                        consecutive_failures, last_error
+                    );
+                    self.consecutive_discover_failures = 0;
+                }
+                Some(discoveries)
+            }
             Err(e) => {
-                warn!("While loading log directory: {}", e);
+                self.consecutive_discover_failures += 1;
+                let message = e.to_string();
+                if self.last_discover_error.as_deref() != Some(message.as_str()) {
+                    warn!("While loading log directory: {}", message);
+                    self.last_discover_error = Some(message);
+                }
                 None
             }
         }
@@ -242,9 +263,11 @@ where
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::collections::VecDeque;
     use std::fs::{self, File};
     use std::io::{self, Cursor, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     use crate::disk_logdir::DiskLogdir;
     use crate::types::{Step, Tag, WallTime};
@@ -281,6 +304,49 @@ mod tests {
                     io::ErrorKind::PermissionDenied,
                     "unauthorized",
                 )),
+            }
+        }
+
+        fn open(&self, path: &EventFileBuf) -> io::Result<Self::File> {
+            assert_eq!(path, &self.filename);
+            Ok(Cursor::new(self.bytes.clone()))
+        }
+    }
+
+    #[derive(Debug)]
+    struct SequencedDiscoverLogdir {
+        bytes: Vec<u8>,
+        filename: EventFileBuf,
+        run: Run,
+        discoveries: Mutex<VecDeque<Result<(), &'static str>>>,
+    }
+
+    impl SequencedDiscoverLogdir {
+        fn new(
+            filename: EventFileBuf,
+            run: Run,
+            bytes: Vec<u8>,
+            discoveries: Vec<Result<(), &'static str>>,
+        ) -> Self {
+            Self {
+                bytes,
+                filename,
+                run,
+                discoveries: Mutex::new(discoveries.into()),
+            }
+        }
+    }
+
+    impl Logdir for SequencedDiscoverLogdir {
+        type File = Cursor<Vec<u8>>;
+
+        fn discover(&self) -> io::Result<HashMap<Run, Vec<EventFileBuf>>> {
+            match self.discoveries.lock().unwrap().pop_front() {
+                Some(Ok(())) => Ok(vec![(self.run.clone(), vec![self.filename.clone()])]
+                    .into_iter()
+                    .collect()),
+                Some(Err(message)) => Err(io::Error::new(io::ErrorKind::PermissionDenied, message)),
+                None => panic!("unexpected discover call"),
             }
         }
 
@@ -463,6 +529,43 @@ mod tests {
             commit.runs.read().unwrap().keys().collect::<HashSet<_>>(),
             vec![&run].into_iter().collect(),
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_discover_error_state_resets_after_recovery() -> Result<(), Box<dyn std::error::Error>> {
+        let run = Run("train".to_string());
+        let tag = Tag("accuracy".to_string());
+        let filename = EventFileBuf(PathBuf::from("train/tfevents.123"));
+        let mut bytes = Vec::new();
+        bytes.write_scalar(&tag, Step(7), WallTime::new(1234.5).unwrap(), 0.75)?;
+
+        let commit = Commit::new();
+        let logdir = SequencedDiscoverLogdir::new(
+            filename,
+            run.clone(),
+            bytes,
+            vec![Ok(()), Err("unauthorized"), Err("unauthorized"), Ok(())],
+        );
+        let mut loader =
+            LogdirLoader::new(&commit, logdir, 1, Arc::new(PluginSamplingHint::default()));
+
+        loader.reload();
+        assert_eq!(loader.last_discover_error, None);
+        assert_eq!(loader.consecutive_discover_failures, 0);
+
+        loader.reload();
+        assert_eq!(loader.last_discover_error.as_deref(), Some("unauthorized"));
+        assert_eq!(loader.consecutive_discover_failures, 1);
+
+        loader.reload();
+        assert_eq!(loader.last_discover_error.as_deref(), Some("unauthorized"));
+        assert_eq!(loader.consecutive_discover_failures, 2);
+
+        loader.reload();
+        assert_eq!(loader.last_discover_error, None);
+        assert_eq!(loader.consecutive_discover_failures, 0);
 
         Ok(())
     }
