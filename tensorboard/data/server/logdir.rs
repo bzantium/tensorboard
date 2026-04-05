@@ -130,17 +130,23 @@ where
     /// client while this reload is in progress (should not happen if the commit is only being
     /// updated by a single `LogdirLoader`).
     pub fn reload(&mut self) {
-        let discoveries = self.discover();
+        let discoveries = match self.discover() {
+            Some(discoveries) => discoveries,
+            None => return,
+        };
         self.synchronize_runs(&discoveries);
         self.load_runs(discoveries);
     }
 
     /// Finds all event files under the log directory and groups them by run.
-    fn discover(&self) -> Discoveries {
-        self.logdir.discover().unwrap_or_else(|e| {
-            warn!("While loading log directory: {}", e);
-            Default::default()
-        })
+    fn discover(&self) -> Option<Discoveries> {
+        match self.logdir.discover() {
+            Ok(discoveries) => Some(discoveries),
+            Err(e) => {
+                warn!("While loading log directory: {}", e);
+                None
+            }
+        }
     }
 
     /// Updates `self.runs` by adding new runs and removing runs all of whose event files have been
@@ -237,11 +243,52 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
     use std::fs::{self, File};
-    use std::io::Write;
+    use std::io::{self, Cursor, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::disk_logdir::DiskLogdir;
     use crate::types::{Step, Tag, WallTime};
     use crate::writer::SummaryWriteExt;
+
+    #[derive(Debug)]
+    struct FlakyDiscoverLogdir {
+        bytes: Vec<u8>,
+        filename: EventFileBuf,
+        run: Run,
+        discover_count: AtomicUsize,
+    }
+
+    impl FlakyDiscoverLogdir {
+        fn new(filename: EventFileBuf, run: Run, bytes: Vec<u8>) -> Self {
+            Self {
+                bytes,
+                filename,
+                run,
+                discover_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Logdir for FlakyDiscoverLogdir {
+        type File = Cursor<Vec<u8>>;
+
+        fn discover(&self) -> io::Result<HashMap<Run, Vec<EventFileBuf>>> {
+            match self.discover_count.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(vec![(self.run.clone(), vec![self.filename.clone()])]
+                    .into_iter()
+                    .collect()),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "unauthorized",
+                )),
+            }
+        }
+
+        fn open(&self, path: &EventFileBuf) -> io::Result<Self::File> {
+            assert_eq!(path, &self.filename);
+            Ok(Cursor::new(self.bytes.clone()))
+        }
+    }
 
     #[test]
     fn test_basic() -> Result<(), Box<dyn std::error::Error>> {
@@ -378,6 +425,44 @@ mod tests {
         loader.reload();
         assert_eq!(get_run_names(), vec!["test", "val"]);
         assert_eq!(get_test_scalar(), Some(0.75));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_discover_error_preserves_stale_runs() -> Result<(), Box<dyn std::error::Error>> {
+        let run = Run("train".to_string());
+        let tag = Tag("accuracy".to_string());
+        let filename = EventFileBuf(PathBuf::from("train/tfevents.123"));
+        let mut bytes = Vec::new();
+        bytes.write_scalar(&tag, Step(7), WallTime::new(1234.5).unwrap(), 0.75)?;
+
+        let commit = Commit::new();
+        let logdir = FlakyDiscoverLogdir::new(filename, run.clone(), bytes);
+        let mut loader =
+            LogdirLoader::new(&commit, logdir, 1, Arc::new(PluginSamplingHint::default()));
+
+        loader.reload();
+        let get_scalar = || {
+            let runs = commit.runs.read().unwrap();
+            let scalar = runs[&run].read().unwrap().scalars[&tag]
+                .valid_values()
+                .next()
+                .map(|(_, _, value)| value.0);
+            scalar
+        };
+        assert_eq!(get_scalar(), Some(0.75));
+        assert_eq!(
+            commit.runs.read().unwrap().keys().collect::<HashSet<_>>(),
+            vec![&run].into_iter().collect(),
+        );
+
+        loader.reload();
+        assert_eq!(get_scalar(), Some(0.75));
+        assert_eq!(
+            commit.runs.read().unwrap().keys().collect::<HashSet<_>>(),
+            vec![&run].into_iter().collect(),
+        );
 
         Ok(())
     }

@@ -80,7 +80,17 @@ struct ListResponseItem {
 
 impl Client {
     fn send_authenticated(&self, rb: RequestBuilder) -> reqwest::Result<Response> {
-        self.token_store.authenticate(rb).send()
+        let retry_rb = rb.try_clone();
+        let response = self.token_store.authenticate(rb).send()?;
+        if response.status() != StatusCode::UNAUTHORIZED {
+            return Ok(response);
+        }
+        self.token_store.invalidate();
+        debug!("GCS request returned 401; retrying once with a fresh token");
+        match retry_rb {
+            Some(rb) => self.token_store.authenticate(rb).send(),
+            None => Ok(response),
+        }
     }
 
     /// Lists all objects in a bucket matching the given prefix.

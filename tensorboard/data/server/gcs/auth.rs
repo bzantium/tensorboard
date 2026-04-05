@@ -187,4 +187,10 @@ impl TokenStore {
         }
         rb
     }
+
+    /// Discards any cached access token so that the next request re-fetches credentials.
+    pub fn invalidate(&self) {
+        let mut token = self.token.write().expect("failed to write auth token");
+        *token = None;
+    }
 }

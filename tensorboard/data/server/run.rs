@@ -282,10 +282,18 @@ impl<R: Read> RunLoader<R> {
 
             loop {
                 use crate::event_file::ReadEventError::ReadRecordError;
-                use crate::tf_record::ReadRecordError::Truncated;
+                use crate::tf_record::ReadRecordError::{Io, Truncated};
                 let event = match reader.read_event() {
                     Ok(event) => event,
                     Err(ReadRecordError(Truncated)) => break,
+                    Err(ReadRecordError(Io(e))) => {
+                        warn!(
+                            "Transient read error in {}: {:?}; will retry on next reload",
+                            filename.0.display(),
+                            e
+                        );
+                        break;
+                    }
                     Err(e) => {
                         // TODO(@wchargin): Improve error handling?
                         warn!("Read error in {}: {:?}", filename.0.display(), e);
@@ -419,13 +427,71 @@ mod test {
     use super::*;
     use bytes::Bytes;
     use std::fs::File;
-    use std::io::{BufWriter, Write};
+    use std::io::{self, BufWriter, Cursor, Read, Write};
+    use std::sync::Mutex;
 
     use crate::commit::Commit;
     use crate::data_compat::plugin_names;
     use crate::disk_logdir::DiskLogdir;
     use crate::types::Run;
     use crate::writer::SummaryWriteExt;
+
+    #[derive(Debug)]
+    struct FlakyReader {
+        inner: Cursor<Vec<u8>>,
+        fail_once: bool,
+    }
+
+    impl FlakyReader {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self {
+                inner: Cursor::new(bytes),
+                fail_once: true,
+            }
+        }
+    }
+
+    impl Read for FlakyReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.fail_once {
+                self.fail_once = false;
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "unauthorized",
+                ));
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    #[derive(Debug)]
+    struct SingleFileLogdir {
+        reader: Mutex<Option<FlakyReader>>,
+    }
+
+    impl SingleFileLogdir {
+        fn new(reader: FlakyReader) -> Self {
+            Self {
+                reader: Mutex::new(Some(reader)),
+            }
+        }
+    }
+
+    impl crate::logdir::Logdir for SingleFileLogdir {
+        type File = FlakyReader;
+
+        fn discover(&self) -> io::Result<HashMap<Run, Vec<EventFileBuf>>> {
+            unreachable!("discover is not used in this test")
+        }
+
+        fn open(&self, _path: &EventFileBuf) -> io::Result<Self::File> {
+            self.reader
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "reader already opened"))
+        }
+    }
 
     #[test]
     fn test() -> Result<(), Box<dyn std::error::Error>> {
@@ -805,6 +871,63 @@ mod test {
         let run_graph_tag = Tag(GraphDefValue::TAG_NAME.to_string());
         let graph_ts = run_data.blob_sequences.get(&run_graph_tag).unwrap();
         assert_eq!(graph_ts.valid_values().count(), 3);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_reload_recovers_after_transient_io_error() -> Result<(), Box<dyn std::error::Error>> {
+        let run = Run("train".to_string());
+        let tag = Tag("accuracy".to_string());
+        let filename = EventFileBuf(std::path::PathBuf::from("tfevents.123"));
+        let mut bytes = Vec::new();
+        bytes.write_event(&pb::Event {
+            wall_time: 1234.0,
+            what: Some(pb::event::What::FileVersion("brain.Event:2".to_string())),
+            ..Default::default()
+        })?;
+        bytes.write_scalar(&tag, Step(7), WallTime::new(1234.5).unwrap(), 0.75)?;
+
+        let mut loader = RunLoader::new(run.clone(), Arc::new(PluginSamplingHint::default()));
+        let logdir = SingleFileLogdir::new(FlakyReader::new(bytes));
+        let commit = Commit::new();
+        commit
+            .runs
+            .write()
+            .expect("write-locking runs map")
+            .insert(run.clone(), Default::default());
+
+        {
+            let runs = commit.runs.read().unwrap();
+            loader.reload(&logdir, vec![filename.clone()], &runs[&run]);
+        }
+        assert!(matches!(
+            loader.files.get(&filename),
+            Some(EventFile::Active(_))
+        ));
+        assert!(commit.runs.read().unwrap()[&run]
+            .read()
+            .unwrap()
+            .scalars
+            .is_empty());
+
+        {
+            let runs = commit.runs.read().unwrap();
+            loader.reload(&logdir, vec![filename], &runs[&run]);
+        }
+        {
+            let runs = commit.runs.read().unwrap();
+            let run_data = runs[&run].read().unwrap();
+            let scalar_ts = &run_data.scalars[&tag];
+            assert_eq!(
+                scalar_ts.valid_values().collect::<Vec<_>>(),
+                vec![(
+                    Step(7),
+                    WallTime::new(1234.5).unwrap(),
+                    &commit::ScalarValue(0.75),
+                )]
+            );
+        }
 
         Ok(())
     }
