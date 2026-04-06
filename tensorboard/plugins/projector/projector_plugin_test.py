@@ -19,6 +19,7 @@
 import gzip
 import io
 import json
+import logging
 import os
 import numpy as np
 import tensorflow as tf
@@ -46,6 +47,15 @@ from tensorboard.util import test_util
 tf.compat.v1.disable_v2_behavior()
 
 USING_REAL_TF = tf_compat.__version__ != "stub"
+
+
+class _CollectingHandler(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
 
 
 class ProjectorAppTest(tf.test.TestCase):
@@ -408,6 +418,26 @@ class ProjectorAppTest(tf.test.TestCase):
                 "/tmp/logdir", GcsfsHttpError("401 Unauthorized")
             )
         )
+
+    def testSuppressCloudRetryLogsOnlyForCloudLogdir(self):
+        retry_logger = logging.getLogger("gcsfs.retry")
+        handler = _CollectingHandler()
+        old_level = retry_logger.level
+        old_propagate = retry_logger.propagate
+        retry_logger.setLevel(logging.ERROR)
+        retry_logger.propagate = False
+        retry_logger.addHandler(handler)
+        self.addCleanup(retry_logger.removeHandler, handler)
+        self.addCleanup(retry_logger.setLevel, old_level)
+        self.addCleanup(setattr, retry_logger, "propagate", old_propagate)
+
+        with projector_plugin._suppress_cloud_retry_logs("gs://bucket/logdir"):
+            retry_logger.error("suppressed")
+        with projector_plugin._suppress_cloud_retry_logs("/tmp/logdir"):
+            retry_logger.error("visible")
+
+        self.assertLen(handler.records, 1)
+        self.assertEqual(handler.records[0].getMessage(), "visible")
 
     def testCloudPathHelpersPreserveGsPrefix(self):
         config_fpath = "gs://bucket/logdir/run1/projector_config.pbtxt"

@@ -16,7 +16,9 @@
 
 
 import collections
+import contextlib
 import functools
+import logging
 import mimetypes
 import os
 import posixpath
@@ -272,6 +274,30 @@ def _is_cloud_filesystem_error(logdir, exception):
     return module_name.startswith(("aiohttp.", "fsspec.", "gcsfs."))
 
 
+class _SuppressCurrentThreadLogs(logging.Filter):
+    def __init__(self, thread_id):
+        super().__init__()
+        self._thread_id = thread_id
+
+    def filter(self, record):
+        return record.thread != self._thread_id
+
+
+@contextlib.contextmanager
+def _suppress_cloud_retry_logs(logdir):
+    if not logdir or not io_util.IsCloudPath(logdir):
+        yield
+        return
+
+    retry_logger = logging.getLogger("gcsfs.retry")
+    thread_filter = _SuppressCurrentThreadLogs(threading.get_ident())
+    retry_logger.addFilter(thread_filter)
+    try:
+        yield
+    finally:
+        retry_logger.removeFilter(thread_filter)
+
+
 class ProjectorPlugin(base_plugin.TBPlugin):
     """Embedding projector."""
 
@@ -398,36 +424,37 @@ class ProjectorPlugin(base_plugin.TBPlugin):
             return
 
         try:
-            if self.data_provider and self.logdir:
-                # Create a background context; we may not be in a request.
-                ctx = context.RequestContext()
-                run_paths = {
-                    run.run_name: _join_path(self.logdir, run.run_name)
-                    for run in self.data_provider.list_runs(
-                        ctx, experiment_id=""
-                    )
-                }
-            else:
-                run_paths = {}
-            run_paths_changed = run_paths != self._run_paths
-            self._run_paths = run_paths
+            with _suppress_cloud_retry_logs(self.logdir):
+                if self.data_provider and self.logdir:
+                    # Create a background context; we may not be in a request.
+                    ctx = context.RequestContext()
+                    run_paths = {
+                        run.run_name: _join_path(self.logdir, run.run_name)
+                        for run in self.data_provider.list_runs(
+                            ctx, experiment_id=""
+                        )
+                    }
+                else:
+                    run_paths = {}
+                run_paths_changed = run_paths != self._run_paths
+                self._run_paths = run_paths
 
-            run_path_pairs = list(self._run_paths.items())
-            self._append_plugin_asset_directories(run_path_pairs)
-            # Also accept the root logdir as a model checkpoint directory,
-            # so that the projector still works when there are no runs.
-            # (Case on `run` rather than `path` to avoid issues with
-            # absolute/relative paths on any filesystems.)
-            if "." not in self._run_paths:
-                run_path_pairs.append((".", self.logdir))
-            if run_paths_changed or _latest_checkpoints_changed(
-                self._configs, run_path_pairs
-            ):
-                self.readers = {}
-                self._configs, self.config_fpaths = (
-                    self._read_latest_config_files(run_path_pairs)
-                )
-                self._augment_configs_with_checkpoint_info()
+                run_path_pairs = list(self._run_paths.items())
+                self._append_plugin_asset_directories(run_path_pairs)
+                # Also accept the root logdir as a model checkpoint directory,
+                # so that the projector still works when there are no runs.
+                # (Case on `run` rather than `path` to avoid issues with
+                # absolute/relative paths on any filesystems.)
+                if "." not in self._run_paths:
+                    run_path_pairs.append((".", self.logdir))
+                if run_paths_changed or _latest_checkpoints_changed(
+                    self._configs, run_path_pairs
+                ):
+                    self.readers = {}
+                    self._configs, self.config_fpaths = (
+                        self._read_latest_config_files(run_path_pairs)
+                    )
+                    self._augment_configs_with_checkpoint_info()
         except Exception as e:  # pylint: disable=broad-except
             if _is_unsupported_filesystem_error(e):
                 self._inactive_due_to_unsupported_filesystem = True
