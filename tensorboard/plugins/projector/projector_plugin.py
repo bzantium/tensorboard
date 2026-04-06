@@ -257,6 +257,21 @@ def _is_unsupported_filesystem_error(exception):
     )
 
 
+def _is_cloud_filesystem_error(logdir, exception):
+    if not logdir or not io_util.IsCloudPath(logdir):
+        return False
+    if _is_unsupported_filesystem_error(exception):
+        return True
+    if isinstance(exception, OSError):
+        return True
+    tf_errors = getattr(tf, "errors", None)
+    op_error = getattr(tf_errors, "OpError", None)
+    if op_error and isinstance(exception, op_error):
+        return True
+    module_name = exception.__class__.__module__
+    return module_name.startswith(("aiohttp.", "fsspec.", "gcsfs."))
+
+
 class ProjectorPlugin(base_plugin.TBPlugin):
     """Embedding projector."""
 
@@ -281,6 +296,7 @@ class ProjectorPlugin(base_plugin.TBPlugin):
         # because doing so is potentially expensive.
         self._is_active = False
         self._inactive_due_to_unsupported_filesystem = False
+        self._inactive_due_to_cloud_filesystem_error = False
 
         # The running thread that is currently determining whether the plugin is
         # active. If such a thread exists, do not start a duplicate thread.
@@ -322,6 +338,9 @@ class ProjectorPlugin(base_plugin.TBPlugin):
             return False
 
         if self._inactive_due_to_unsupported_filesystem:
+            return False
+
+        if self._inactive_due_to_cloud_filesystem_error:
             return False
 
         if self._is_active:
@@ -375,6 +394,9 @@ class ProjectorPlugin(base_plugin.TBPlugin):
         if self._inactive_due_to_unsupported_filesystem:
             return
 
+        if self._inactive_due_to_cloud_filesystem_error:
+            return
+
         try:
             if self.data_provider and self.logdir:
                 # Create a background context; we may not be in a request.
@@ -406,16 +428,25 @@ class ProjectorPlugin(base_plugin.TBPlugin):
                     self._read_latest_config_files(run_path_pairs)
                 )
                 self._augment_configs_with_checkpoint_info()
-        except ValueError as e:
-            if not _is_unsupported_filesystem_error(e):
+        except Exception as e:  # pylint: disable=broad-except
+            if _is_unsupported_filesystem_error(e):
+                self._inactive_due_to_unsupported_filesystem = True
+                logger.warning(
+                    "Projector plugin disabled for unsupported filesystem in "
+                    "logdir %r: %s",
+                    self.logdir,
+                    e,
+                )
+            elif _is_cloud_filesystem_error(self.logdir, e):
+                self._inactive_due_to_cloud_filesystem_error = True
+                logger.warning(
+                    "Projector plugin disabled after cloud filesystem error in "
+                    "logdir %r: %s",
+                    self.logdir,
+                    e,
+                )
+            else:
                 raise
-            self._inactive_due_to_unsupported_filesystem = True
-            logger.warning(
-                "Projector plugin disabled for unsupported filesystem in "
-                "logdir %r: %s",
-                self.logdir,
-                e,
-            )
             self.readers = {}
             self._configs = {}
             self.config_fpaths = {}
