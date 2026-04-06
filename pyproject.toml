@@ -43,6 +43,16 @@ projector = "tensorboard.plugins.projector.projector_plugin:ProjectorPlugin"
 # Source-checkout runs import `bleach` directly; release wheels vendor it.
 tensorflow = ["tf-nightly", "bleach"]
 
+[tool.uv]
+# The editable project's runtime dependencies are loaded dynamically from
+# tensorboard/pip_package/requirements.txt, so include it in uv's cache keys.
+cache-keys = [
+    {file = "pyproject.toml"},
+    {file = "setup.py"},
+    {file = "setup.cfg"},
+    {file = "tensorboard/pip_package/requirements.txt"},
+]
+
 [tool.setuptools.dynamic]
 version = {attr = "tensorboard.version.VERSION"}
 dependencies = {file = ["tensorboard/pip_package/requirements.txt"]}
