@@ -188,6 +188,53 @@ class GetServerBinaryTest(tb_test.TestCase):
         self.assertEqual(result.path, local_binary)
 
     @mock.patch.dict(os.environ, {}, clear=True)
+    def test_rebuilds_outdated_local_dev_binary(self):
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        stale_binary = os.path.join(tmpdir.name, "stale_rustboard")
+        rebuilt_binary = os.path.join(tmpdir.name, "rebuilt_rustboard")
+        with open(stale_binary, "wb"):
+            pass
+
+        with mock.patch.object(
+            server_ingester, "_local_dev_server_binary", return_value=stale_binary
+        ), mock.patch.object(
+            server_ingester,
+            "_local_dev_server_binary_needs_rebuild",
+            return_value=True,
+        ), mock.patch.object(
+            server_ingester,
+            "_build_local_dev_server_binary",
+            return_value=rebuilt_binary,
+        ) as build:
+            result = server_ingester.get_server_binary()
+
+        self.assertEqual(result.path, rebuilt_binary)
+        build.assert_called_once_with()
+
+    @mock.patch.dict(os.environ, {}, clear=True)
+    def test_uses_existing_local_dev_binary_when_rebuild_fails(self):
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        stale_binary = os.path.join(tmpdir.name, "stale_rustboard")
+        with open(stale_binary, "wb"):
+            pass
+
+        with mock.patch.object(
+            server_ingester, "_local_dev_server_binary", return_value=stale_binary
+        ), mock.patch.object(
+            server_ingester,
+            "_local_dev_server_binary_needs_rebuild",
+            return_value=True,
+        ), mock.patch.object(
+            server_ingester, "_build_local_dev_server_binary", return_value=None
+        ) as build:
+            result = server_ingester.get_server_binary()
+
+        self.assertEqual(result.path, stale_binary)
+        build.assert_called_once_with()
+
+    @mock.patch.dict(os.environ, {}, clear=True)
     def test_falls_back_to_package_binary_when_auto_build_fails(self):
         tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(tmpdir.cleanup)

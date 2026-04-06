@@ -49,10 +49,32 @@ def _local_dev_server_binary():
         os.path.join(data_dir, "target", "release", binary_name),
         os.path.join(data_dir, "target", "debug", binary_name),
     ]
-    for path in candidates:
-        if os.path.isfile(path):
-            return path
-    return None
+    existing = [path for path in candidates if os.path.isfile(path)]
+    if not existing:
+        return None
+    return max(existing, key=os.path.getmtime)
+
+
+def _local_dev_server_binary_needs_rebuild(binary_path):
+    """Whether source files under the Rust data server are newer than the binary."""
+    if not binary_path or not os.path.isfile(binary_path):
+        return False
+    data_dir = _local_dev_server_dir()
+    try:
+        binary_mtime = os.path.getmtime(binary_path)
+    except OSError:
+        return True
+
+    for root, dirs, files in os.walk(data_dir):
+        dirs[:] = [d for d in dirs if d != "target"]
+        for filename in files:
+            path = os.path.join(root, filename)
+            try:
+                if os.path.getmtime(path) > binary_mtime:
+                    return True
+            except OSError:
+                continue
+    return False
 
 
 def _build_local_dev_server_binary():
@@ -327,6 +349,14 @@ def get_server_binary():
         return ServerBinary(env_result, version=None)
 
     local_result = _local_dev_server_binary()
+    if local_result and _local_dev_server_binary_needs_rebuild(local_result):
+        logging.info(
+            "Rebuilding local rustboard because sources are newer than %s",
+            local_result,
+        )
+        rebuilt = _build_local_dev_server_binary()
+        if rebuilt:
+            local_result = rebuilt
     if local_result:
         logging.info("Server binary (from local cargo build): %s", local_result)
         return ServerBinary(local_result, version=None)
