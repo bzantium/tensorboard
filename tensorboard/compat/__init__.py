@@ -23,6 +23,19 @@ and defer the search and loading of the module until necessary.
 import tensorboard.lazy as _lazy
 
 
+def _looks_like_tensorflow_api(module):
+    try:
+        return (
+            hasattr(module, "__version__")
+            and hasattr(module, "compat")
+            and hasattr(module, "errors")
+            and hasattr(module, "io")
+            and hasattr(module.io, "gfile")
+        )
+    except Exception:  # pylint: disable=broad-except
+        return False
+
+
 @_lazy.lazy_load("tensorboard.compat.tf")
 def tf():
     """Provide the root module of a TF-like API for use within TensorBoard.
@@ -44,7 +57,8 @@ def tf():
         try:
             import tensorflow
 
-            return tensorflow
+            if _looks_like_tensorflow_api(tensorflow):
+                return tensorflow
         except ImportError:
             pass
     from tensorboard.compat import tensorflow_stub

@@ -1,6 +1,6 @@
 # Description:
 # Compatibility interfaces for TensorBoard.
-load("@rules_python//python:py_library.bzl", "py_library")
+load("@rules_python//python:py_library.bzl", "py_library", "py_test")
 
 package(default_visibility = ["//tensorboard:internal"])
 
@@ -42,6 +42,17 @@ py_library(
     deps = [
         ":compat",
         "//tensorboard/compat/tensorflow_stub",
+    ],
+)
+
+py_test(
+    name = "compat_test",
+    size = "small",
+    srcs = ["compat_test.py"],
+    python_version = "PY3",
+    srcs_version = "PY3",
+    deps = [
+        ":tensorflow",
     ],
 )
 
