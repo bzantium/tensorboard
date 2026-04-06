@@ -17,6 +17,7 @@
 import errno
 import logging
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -36,18 +37,57 @@ logger = tb_logging.get_logger()
 _ENV_DATA_SERVER_BINARY = "TENSORBOARD_DATA_SERVER_BINARY"
 
 
+def _local_dev_server_dir():
+    return os.path.join(os.path.dirname(__file__), "server")
+
+
 def _local_dev_server_binary():
     """Return a repo-local cargo-built data server binary, if present."""
     binary_name = "rustboard.exe" if os.name == "nt" else "rustboard"
-    data_dir = os.path.dirname(__file__)
+    data_dir = _local_dev_server_dir()
     candidates = [
-        os.path.join(data_dir, "server", "target", "release", binary_name),
-        os.path.join(data_dir, "server", "target", "debug", binary_name),
+        os.path.join(data_dir, "target", "release", binary_name),
+        os.path.join(data_dir, "target", "debug", binary_name),
     ]
     for path in candidates:
         if os.path.isfile(path):
             return path
     return None
+
+
+def _build_local_dev_server_binary():
+    """Build a repo-local data server binary if this looks like a source checkout."""
+    data_dir = _local_dev_server_dir()
+    cargo_toml = os.path.join(data_dir, "Cargo.toml")
+    if not os.path.isfile(cargo_toml):
+        return None
+    if shutil.which("cargo") is None:
+        logger.info(
+            "Skipping local rustboard auto-build because `cargo` is not available"
+        )
+        return None
+
+    logger.info("Building local rustboard with cargo from %s", data_dir)
+    try:
+        subprocess.check_call(
+            ["cargo", "build", "--manifest-path", cargo_toml],
+            cwd=data_dir,
+        )
+    except (OSError, subprocess.CalledProcessError) as e:
+        logger.warning(
+            "Failed to auto-build local rustboard from %s: %s",
+            data_dir,
+            e,
+        )
+        return None
+
+    result = _local_dev_server_binary()
+    if result is None:
+        logger.warning(
+            "Cargo build completed but no rustboard binary was found under %s/target",
+            data_dir,
+        )
+    return result
 
 
 class ExistingServerDataIngester(ingester.DataIngester):
@@ -287,6 +327,11 @@ def get_server_binary():
         return ServerBinary(env_result, version=None)
 
     local_result = _local_dev_server_binary()
+    if local_result:
+        logging.info("Server binary (from local cargo build): %s", local_result)
+        return ServerBinary(local_result, version=None)
+
+    local_result = _build_local_dev_server_binary()
     if local_result:
         logging.info("Server binary (from local cargo build): %s", local_result)
         return ServerBinary(local_result, version=None)

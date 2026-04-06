@@ -78,6 +78,13 @@ As an alternative to `--define=link_data_server=true`, you can set the
 server binary, and pass `--load_fast=true`. If running with `bazel run`, this
 should be an absolute path.
 
+In a source checkout, TensorBoard will also look for a repo-local Cargo build of
+RustBoard under `tensorboard/data/server/target/...`. If none exists and Cargo
+is installed, TensorBoard will automatically run `cargo build` once and then
+reuse the resulting local binary for subsequent `--load_fast` runs. This makes
+`uv run tensorboard --load_fast ...` work without manually building RustBoard
+first.
+
 As another alternative, you can install the `tensorboard_data_server` package
 into your virtualenv. To do so, run:
 
@@ -93,8 +100,12 @@ is:
 
 -   an explicit `TENSORBOARD_DATA_SERVER_BINARY` environment variable is honored
     if present and non-empty; else
+-   a repo-local Cargo-built `rustboard` binary is used if available, or
+    auto-built if possible in a source checkout; else
+-   the server bundled with `--define=link_data_server=true` is used if present;
+    else
 -   the `tensorboard_data_server` package is queried if it is installed; else
--   the server bundled with `--define=link_data_server=true` is used.
+-   startup fails.
 
 ## Adding or updating third-party dependencies
 
