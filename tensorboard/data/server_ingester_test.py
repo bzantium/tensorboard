@@ -139,5 +139,56 @@ class ServerInfoTest(tb_test.TestCase):
         self.assertFalse(b.at_least_version("0.5.0"))
 
 
+class GetServerBinaryTest(tb_test.TestCase):
+    @mock.patch.dict(os.environ, {}, clear=True)
+    def test_prefers_local_dev_binary_over_package_binary(self):
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        local_binary = os.path.join(tmpdir.name, "rustboard")
+        package_binary = os.path.join(tmpdir.name, "package_server")
+        with open(local_binary, "wb"):
+            pass
+        with open(package_binary, "wb"):
+            pass
+
+        fake_pkg = mock.Mock()
+        fake_pkg.server_binary.return_value = package_binary
+        fake_pkg.__version__ = "0.8.0a0"
+
+        with mock.patch.object(
+            server_ingester, "_local_dev_server_binary", return_value=local_binary
+        ):
+            with mock.patch.dict(
+                "sys.modules", {"tensorboard_data_server": fake_pkg}
+            ):
+                result = server_ingester.get_server_binary()
+
+        self.assertEqual(result.path, local_binary)
+
+    @mock.patch.dict(os.environ, {}, clear=True)
+    def test_falls_back_to_package_binary_without_local_dev_binary(self):
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        package_binary = os.path.join(tmpdir.name, "package_server")
+        with open(package_binary, "wb"):
+            pass
+
+        fake_pkg = mock.Mock()
+        fake_pkg.server_binary.return_value = package_binary
+        fake_pkg.__version__ = "0.8.0a0"
+
+        with mock.patch.object(
+            server_ingester, "_local_dev_server_binary", return_value=None
+        ):
+            with mock.patch("os.path.exists", return_value=False):
+                with mock.patch.dict(
+                    "sys.modules", {"tensorboard_data_server": fake_pkg}
+                ):
+                    result = server_ingester.get_server_binary()
+
+        self.assertEqual(result.path, package_binary)
+        self.assertEqual(str(result._version), "0.8.0a0")
+
+
 if __name__ == "__main__":
     tb_test.main()

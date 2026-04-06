@@ -36,6 +36,20 @@ logger = tb_logging.get_logger()
 _ENV_DATA_SERVER_BINARY = "TENSORBOARD_DATA_SERVER_BINARY"
 
 
+def _local_dev_server_binary():
+    """Return a repo-local cargo-built data server binary, if present."""
+    binary_name = "rustboard.exe" if os.name == "nt" else "rustboard"
+    data_dir = os.path.dirname(__file__)
+    candidates = [
+        os.path.join(data_dir, "server", "target", "release", binary_name),
+        os.path.join(data_dir, "server", "target", "debug", binary_name),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
 class ExistingServerDataIngester(ingester.DataIngester):
     """Connect to an already running gRPC server."""
 
@@ -271,6 +285,11 @@ def get_server_binary():
                 % (_ENV_DATA_SERVER_BINARY, env_result)
             )
         return ServerBinary(env_result, version=None)
+
+    local_result = _local_dev_server_binary()
+    if local_result:
+        logging.info("Server binary (from local cargo build): %s", local_result)
+        return ServerBinary(local_result, version=None)
 
     bundle_result = os.path.join(os.path.dirname(__file__), "server", "server")
     if os.path.exists(bundle_result):
