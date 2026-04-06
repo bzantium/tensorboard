@@ -336,6 +336,78 @@ class ProjectorAppTest(tf.test.TestCase):
         start_mock.assert_called_once_with(thread)
         warning_mock.assert_called_once()
 
+    def testCloudPathHelpersPreserveGsPrefix(self):
+        config_fpath = "gs://bucket/logdir/run1/projector_config.pbtxt"
+        assets_dir = (
+            "gs://bucket/logdir/run1/plugins/"
+            "org_tensorflow_tensorboard_projector"
+        )
+
+        self.assertEqual(
+            projector_plugin._join_path("gs://bucket/logdir", "run1"),
+            "gs://bucket/logdir/run1",
+        )
+        self.assertEqual(
+            projector_plugin._assets_dir_to_logdir(assets_dir),
+            "gs://bucket/logdir/run1",
+        )
+        self.assertEqual(
+            projector_plugin._rel_to_abs_asset_path(
+                "metadata.tsv", config_fpath
+            ),
+            "gs://bucket/logdir/run1/metadata.tsv",
+        )
+        self.assertEqual(
+            projector_plugin._rel_to_abs_asset_path(
+                "gs://other-bucket/metadata.tsv", config_fpath
+            ),
+            "gs://other-bucket/metadata.tsv",
+        )
+
+    def testAppendPluginAssetDirectoriesPreservesGsPrefix(self):
+        context = base_plugin.TBContext(logdir="gs://bucket/logdir")
+        self.plugin = projector_plugin.ProjectorPlugin(context)
+        self.plugin._run_paths = {"run1": "gs://bucket/logdir/run1"}
+        run_path_pairs = [("run1", "gs://bucket/logdir/run1")]
+
+        with mock.patch.object(
+            projector_plugin.plugin_asset_util,
+            "ListAssets",
+            return_value=[projector_plugin.metadata.PROJECTOR_FILENAME],
+        ):
+            self.plugin._append_plugin_asset_directories(run_path_pairs)
+
+        self.assertEqual(
+            run_path_pairs[-1],
+            (
+                "run1",
+                "gs://bucket/logdir/run1/plugins/"
+                "org_tensorflow_tensorboard_projector",
+            ),
+        )
+
+    def testReadTensorBinaryFileSupportsGsPaths(self):
+        expected = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+        tensor_bytes = expected.tobytes()
+
+        with mock.patch.object(
+            projector_plugin.tf.io.gfile,
+            "GFile",
+            return_value=io.BytesIO(tensor_bytes),
+        ) as gfile_mock, mock.patch.object(
+            projector_plugin.np,
+            "fromfile",
+            side_effect=AssertionError("np.fromfile should not be used"),
+        ):
+            actual = projector_plugin._read_tensor_binary_file(
+                "gs://bucket/logdir/tensor.bytes", [2, 2]
+            )
+
+        gfile_mock.assert_called_once_with(
+            "gs://bucket/logdir/tensor.bytes", "rb"
+        )
+        self.assertAllEqual(actual, expected)
+
     def _SetupWSGIApp(self):
         logdir = self.log_dir
         multiplexer = event_multiplexer.EventMultiplexer()

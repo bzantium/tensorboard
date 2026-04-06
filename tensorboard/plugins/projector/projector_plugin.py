@@ -19,6 +19,7 @@ import collections
 import functools
 import mimetypes
 import os
+import posixpath
 import threading
 
 import numpy as np
@@ -34,6 +35,7 @@ from tensorboard.compat import tf
 from tensorboard.plugins import base_plugin
 from tensorboard.plugins.projector import metadata
 from tensorboard.plugins.projector.projector_config_pb2 import ProjectorConfig
+from tensorboard.util import io_util
 from tensorboard.util import img_mime_type_detector, tb_logging
 
 logger = tb_logging.get_logger()
@@ -152,15 +154,43 @@ def _read_tensor_tsv_file(fpath):
 def _read_tensor_binary_file(fpath, shape):
     if len(shape) != 2:
         raise ValueError("Tensor must be 2D, got shape {}".format(shape))
-    tensor = np.fromfile(fpath, dtype="float32")
+    with tf.io.gfile.GFile(fpath, "rb") as f:
+        tensor = np.frombuffer(f.read(), dtype="float32")
     return tensor.reshape(shape)
+
+
+def _get_path_module(path):
+    return posixpath if io_util.IsCloudPath(path) else os.path
+
+
+def _join_path(path, *paths):
+    return _get_path_module(path).join(path, *paths)
+
+
+def _dirname(path):
+    return _get_path_module(path).dirname(path)
+
+
+def _basename(path):
+    return _get_path_module(path).basename(path)
+
+
+def _is_absolute_path(path):
+    return io_util.IsCloudPath(path) or os.path.isabs(path)
+
+
+def _abspath(path):
+    if io_util.IsCloudPath(path):
+        return path
+    return os.path.abspath(path)
 
 
 def _assets_dir_to_logdir(assets_dir):
     sub_path = os.path.sep + metadata.PLUGINS_DIR + os.path.sep
+    if io_util.IsCloudPath(assets_dir):
+        sub_path = "/" + metadata.PLUGINS_DIR + "/"
     if sub_path in assets_dir:
-        two_parents_up = os.pardir + os.path.sep + os.pardir
-        return os.path.abspath(os.path.join(assets_dir, two_parents_up))
+        return _dirname(_dirname(assets_dir))
     return assets_dir
 
 
@@ -169,7 +199,7 @@ def _latest_checkpoints_changed(configs, run_path_pairs):
     for run_name, assets_dir in run_path_pairs:
         if run_name not in configs:
             config = ProjectorConfig()
-            config_fpath = os.path.join(assets_dir, metadata.PROJECTOR_FILENAME)
+            config_fpath = _join_path(assets_dir, metadata.PROJECTOR_FILENAME)
             if tf.io.gfile.exists(config_fpath):
                 with tf.io.gfile.GFile(config_fpath, "r") as f:
                     file_content = f.read()
@@ -211,8 +241,8 @@ def _parse_positive_int_param(request, param_name):
 
 def _rel_to_abs_asset_path(fpath, config_fpath):
     fpath = os.path.expanduser(fpath)
-    if not os.path.isabs(fpath):
-        return os.path.join(os.path.dirname(config_fpath), fpath)
+    if not _is_absolute_path(fpath):
+        return _join_path(_dirname(config_fpath), fpath)
     return fpath
 
 
@@ -350,7 +380,7 @@ class ProjectorPlugin(base_plugin.TBPlugin):
                 # Create a background context; we may not be in a request.
                 ctx = context.RequestContext()
                 run_paths = {
-                    run.run_name: os.path.join(self.logdir, run.run_name)
+                    run.run_name: _join_path(self.logdir, run.run_name)
                     for run in self.data_provider.list_runs(
                         ctx, experiment_id=""
                     )
@@ -463,7 +493,7 @@ class ProjectorPlugin(base_plugin.TBPlugin):
         config_fpaths = {}
         for run_name, assets_dir in run_path_pairs:
             config = ProjectorConfig()
-            config_fpath = os.path.join(assets_dir, metadata.PROJECTOR_FILENAME)
+            config_fpath = _join_path(assets_dir, metadata.PROJECTOR_FILENAME)
             if tf.io.gfile.exists(config_fpath):
                 with tf.io.gfile.GFile(config_fpath, "r") as f:
                     file_content = f.read()
@@ -472,7 +502,7 @@ class ProjectorPlugin(base_plugin.TBPlugin):
             for embedding in config.embeddings:
                 if embedding.tensor_path:
                     if not embedding.tensor_name:
-                        embedding.tensor_name = os.path.basename(
+                        embedding.tensor_name = _basename(
                             embedding.tensor_path
                         )
                     has_tensor_files = True
@@ -553,10 +583,10 @@ class ProjectorPlugin(base_plugin.TBPlugin):
             assets = plugin_asset_util.ListAssets(logdir, plugin_assets_name)
             if metadata.PROJECTOR_FILENAME not in assets:
                 continue
-            assets_dir = os.path.join(
+            assets_dir = _join_path(
                 self._run_paths[run], metadata.PLUGINS_DIR, plugin_assets_name
             )
-            assets_path_pair = (run, os.path.abspath(assets_dir))
+            assets_path_pair = (run, _abspath(assets_dir))
             extra.append(assets_path_pair)
         run_path_pairs.extend(extra)
 
@@ -823,9 +853,7 @@ def _find_latest_checkpoint(dir_path):
         ckpt_path = tf.train.latest_checkpoint(dir_path)
         if not ckpt_path:
             # Check the parent directory.
-            ckpt_path = tf.train.latest_checkpoint(
-                os.path.join(dir_path, os.pardir)
-            )
+            ckpt_path = tf.train.latest_checkpoint(_dirname(dir_path))
         return ckpt_path
     except tf.errors.NotFoundError:
         return None

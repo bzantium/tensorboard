@@ -18,6 +18,9 @@
 absl-py >= 0.4
 # NOTE: this version should be >= the grpc version in our WORKSPACE file.
 grpcio >= 1.48.2
+# Enable `gs://` and other cloud filesystems in the TF stub gfile path.
+fsspec >= 2021.06.0
+gcsfs >= 2021.06.0
 markdown >= 2.6.8
 numpy >= 1.12.0
 # The release wheel vendors bleach, but source-checkout installs import it
