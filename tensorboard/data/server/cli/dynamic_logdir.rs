@@ -15,7 +15,6 @@ limitations under the License.
 
 //! Log directory as specified by user arguments.
 
-use log::error;
 use std::collections::HashMap;
 use std::io::{self, Read};
 use std::path::PathBuf;

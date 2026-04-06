@@ -42,7 +42,9 @@ pub struct DataProviderHandler {
 
 impl DataProviderHandler {
     /// Obtains a read-lock to `self.commit.runs`, or fails with `Status::internal`.
-    fn read_runs(&self) -> Result<RwLockReadGuard<HashMap<Run, RwLock<commit::RunData>>>, Status> {
+    fn read_runs(
+        &self,
+    ) -> Result<RwLockReadGuard<'_, HashMap<Run, RwLock<commit::RunData>>>, Status> {
         self.commit
             .runs
             .read()
