@@ -78,6 +78,8 @@ pub struct LogdirLoader<'a, L: Logdir> {
     checksum: bool,
     /// A map defining how many samples per plugin to keep.
     plugin_sampling_hint: Arc<PluginSamplingHint>,
+    /// The most recent successful discovery result.
+    last_successful_discoveries: Option<Discoveries>,
     /// The most recent discovery error, if discovery is currently failing.
     last_discover_error: Option<String>,
     /// Number of consecutive discovery failures since the last success.
@@ -119,6 +121,7 @@ where
             runs: HashMap::new(),
             checksum: true,
             plugin_sampling_hint,
+            last_successful_discoveries: None,
             last_discover_error: None,
             consecutive_discover_failures: 0,
         }
@@ -156,16 +159,30 @@ where
                     );
                     self.consecutive_discover_failures = 0;
                 }
+                self.last_successful_discoveries = Some(discoveries.clone());
                 Some(discoveries)
             }
             Err(e) => {
                 self.consecutive_discover_failures += 1;
                 let message = e.to_string();
+                let stale = self.last_successful_discoveries.as_ref();
                 if self.last_discover_error.as_deref() != Some(message.as_str()) {
-                    warn!("While loading log directory: {}", message);
+                    if let Some(stale) = stale {
+                        warn!(
+                            "While loading log directory: {}; continuing with stale discovery across {} run(s)",
+                            message,
+                            stale.len(),
+                        );
+                    } else {
+                        warn!("While loading log directory: {}", message);
+                    }
                     self.last_discover_error = Some(message);
                 }
-                None
+                if let Some(stale) = stale {
+                    Some(stale.clone())
+                } else {
+                    None
+                }
             }
         }
     }
@@ -267,7 +284,7 @@ mod tests {
     use std::fs::{self, File};
     use std::io::{self, Cursor, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
+    use std::sync::{Arc as StdArc, Mutex};
 
     use crate::disk_logdir::DiskLogdir;
     use crate::types::{Step, Tag, WallTime};
@@ -353,6 +370,76 @@ mod tests {
         fn open(&self, path: &EventFileBuf) -> io::Result<Self::File> {
             assert_eq!(path, &self.filename);
             Ok(Cursor::new(self.bytes.clone()))
+        }
+    }
+
+    #[derive(Debug)]
+    struct MutableBytesDiscoverLogdir {
+        bytes: StdArc<Mutex<Vec<u8>>>,
+        filename: EventFileBuf,
+        run: Run,
+        discoveries: Mutex<VecDeque<Result<(), &'static str>>>,
+    }
+
+    impl MutableBytesDiscoverLogdir {
+        fn new(
+            filename: EventFileBuf,
+            run: Run,
+            bytes: StdArc<Mutex<Vec<u8>>>,
+            discoveries: Vec<Result<(), &'static str>>,
+        ) -> Self {
+            Self {
+                bytes,
+                filename,
+                run,
+                discoveries: Mutex::new(discoveries.into()),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct SharedBytesReader {
+        bytes: StdArc<Mutex<Vec<u8>>>,
+        pos: usize,
+    }
+
+    impl SharedBytesReader {
+        fn new(bytes: StdArc<Mutex<Vec<u8>>>) -> Self {
+            Self { bytes, pos: 0 }
+        }
+    }
+
+    impl Read for SharedBytesReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let bytes = self.bytes.lock().unwrap();
+            if self.pos >= bytes.len() {
+                return Ok(0);
+            }
+            let n = std::cmp::min(buf.len(), bytes.len() - self.pos);
+            buf[..n].copy_from_slice(&bytes[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    impl Logdir for MutableBytesDiscoverLogdir {
+        type File = SharedBytesReader;
+
+        fn discover(&self) -> io::Result<HashMap<Run, Vec<EventFileBuf>>> {
+            match self.discoveries.lock().unwrap().pop_front() {
+                Some(Ok(())) => Ok(vec![(self.run.clone(), vec![self.filename.clone()])]
+                    .into_iter()
+                    .collect()),
+                Some(Err(message)) => {
+                    Err(io::Error::new(io::ErrorKind::PermissionDenied, message))
+                }
+                None => panic!("unexpected discover call"),
+            }
+        }
+
+        fn open(&self, path: &EventFileBuf) -> io::Result<Self::File> {
+            assert_eq!(path, &self.filename);
+            Ok(SharedBytesReader::new(StdArc::clone(&self.bytes)))
         }
     }
 
@@ -566,6 +653,50 @@ mod tests {
         loader.reload();
         assert_eq!(loader.last_discover_error, None);
         assert_eq!(loader.consecutive_discover_failures, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_discover_error_still_reads_existing_files() -> Result<(), Box<dyn std::error::Error>> {
+        let run = Run("train".to_string());
+        let tag = Tag("accuracy".to_string());
+        let filename = EventFileBuf(PathBuf::from("train/tfevents.123"));
+        let mut initial_bytes = Vec::new();
+        initial_bytes.write_scalar(&tag, Step(7), WallTime::new(1234.5).unwrap(), 0.75)?;
+        let shared_bytes = StdArc::new(Mutex::new(initial_bytes));
+
+        let commit = Commit::new();
+        let logdir = MutableBytesDiscoverLogdir::new(
+            filename,
+            run.clone(),
+            StdArc::clone(&shared_bytes),
+            vec![Ok(()), Err("unauthorized")],
+        );
+        let mut loader =
+            LogdirLoader::new(&commit, logdir, 1, Arc::new(PluginSamplingHint::default()));
+
+        let get_scalars = || {
+            let runs = commit.runs.read().unwrap();
+            let values = runs[&run].read().unwrap().scalars[&tag]
+                .valid_values()
+                .map(|(_, _, value)| value.0)
+                .collect::<Vec<f32>>();
+            values
+        };
+
+        loader.reload();
+        assert_eq!(get_scalars(), vec![0.75]);
+
+        shared_bytes
+            .lock()
+            .unwrap()
+            .write_scalar(&tag, Step(8), WallTime::new(1235.5).unwrap(), 0.875)?;
+
+        loader.reload();
+        assert_eq!(get_scalars(), vec![0.75, 0.875]);
+        assert_eq!(loader.last_discover_error.as_deref(), Some("unauthorized"));
+        assert_eq!(loader.consecutive_discover_failures, 1);
 
         Ok(())
     }
