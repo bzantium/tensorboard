@@ -16,7 +16,7 @@ limitations under the License.
 //! Client for listing and reading GCS files.
 
 use bytes::Bytes;
-use log::debug;
+use log::{debug, warn};
 use reqwest::{
     blocking::{Client as HttpClient, RequestBuilder, Response},
     StatusCode, Url,
@@ -83,14 +83,32 @@ impl Client {
         let retry_rb = rb.try_clone();
         let response = self.token_store.authenticate(rb).send()?;
         if response.status() != StatusCode::UNAUTHORIZED {
+            self.token_store.record_auth_success();
             return Ok(response);
         }
+
+        // First 401: invalidate our cached token and retry with a fresh one.
         self.token_store.invalidate();
-        debug!("GCS request returned 401; retrying once with a fresh token");
-        match retry_rb {
-            Some(rb) => self.token_store.authenticate(rb).send(),
-            None => Ok(response),
+        debug!("GCS request returned 401; invalidating token and retrying");
+
+        let retry_rb = match retry_rb {
+            Some(rb) => rb,
+            None => return Ok(response),
+        };
+
+        let retry_response = self.token_store.authenticate(retry_rb).send()?;
+        if retry_response.status() != StatusCode::UNAUTHORIZED {
+            self.token_store.record_auth_success();
+            return Ok(retry_response);
         }
+
+        // Still 401 after token refresh. Record the failure; after enough consecutive
+        // failures this triggers AuthenticationManager recreation to pick up any
+        // new credentials on disk.
+        self.token_store.record_auth_failure();
+        warn!("GCS request still returned 401 after token refresh; credentials may need renewal");
+
+        Ok(retry_response)
     }
 
     /// Lists all objects in a bucket matching the given prefix.

@@ -34,42 +34,106 @@ limitations under the License.
 //! [RFC 6749]: https://tools.ietf.org/html/rfc6749
 //! ["Refreshing Access Tokens"]: https://www.oauth.com/oauth2-servers/access-tokens/refreshing-access-tokens/
 
-use log::{debug, warn};
+use log::{debug, info, warn};
 use std::fmt::{self, Debug};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::RwLock;
 
 use gcp_auth::AuthenticationManager;
 use reqwest::blocking::RequestBuilder;
-use tokio::sync::OnceCell;
 
 const SCOPES: &[&str] = &["https://www.googleapis.com/auth/cloud-platform"];
 
-/// AuthenticationManager across different threads or async tasks.
-static AUTH_MANAGER: OnceCell<AuthenticationManager> = OnceCell::const_new();
+/// After this many consecutive 401 responses, recreate the AuthenticationManager
+/// to pick up fresh credentials from disk.
+const MAX_CONSECUTIVE_401S_BEFORE_RESET: u32 = 3;
+
+/// Resettable wrapper around `AuthenticationManager` that allows re-initialization
+/// when credentials expire or are rotated on disk.
+struct ResettableAuthManager {
+    inner: RwLock<Option<AuthenticationManager>>,
+    generation: AtomicU64,
+}
+
+static AUTH_MANAGER: ResettableAuthManager = ResettableAuthManager {
+    inner: RwLock::new(None),
+    generation: AtomicU64::new(0),
+};
 
 /// Get a GCP Access Token using the `gcp_auth::AuthenticationManager`.
-fn get_token() -> Result<AccessToken, gcp_auth::Error> {
-    async fn authentication_manager() -> &'static AuthenticationManager {
-        AUTH_MANAGER
-            .get_or_init(|| async {
-                AuthenticationManager::new()
-                    .await
-                    .expect("unable to initialize authentication manager")
-            })
-            .await
-    }
-    async fn service_account_token() -> Result<gcp_auth::Token, gcp_auth::Error> {
-        let manager = authentication_manager().await;
-        manager.get_token(SCOPES).await
+///
+/// Returns the token along with the current manager generation, which can be used
+/// to avoid redundant resets when multiple threads detect stale credentials.
+fn get_token() -> Result<(AccessToken, u64), gcp_auth::Error> {
+    // Try to use existing manager under read lock.
+    {
+        let guard = AUTH_MANAGER.inner.read().expect("auth manager lock poisoned");
+        if let Some(ref manager) = *guard {
+            let generation = AUTH_MANAGER.generation.load(Ordering::Acquire);
+            let token = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(manager.get_token(SCOPES))?;
+            return Ok((AccessToken::new(Some(token)), generation));
+        }
     }
 
+    // Manager not yet initialized (or was reset); take write lock.
+    let mut guard = AUTH_MANAGER.inner.write().expect("auth manager lock poisoned");
+    // Double-check: another thread may have initialized while we waited.
+    if guard.is_none() {
+        let is_first_init = AUTH_MANAGER.generation.load(Ordering::Acquire) == 0;
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(AuthenticationManager::new());
+        match result {
+            Ok(manager) => {
+                *guard = Some(manager);
+                AUTH_MANAGER.generation.fetch_add(1, Ordering::Release);
+                if !is_first_init {
+                    info!("Successfully re-initialized GCS authentication manager");
+                }
+            }
+            Err(e) => {
+                if is_first_init {
+                    panic!("unable to initialize authentication manager: {}", e);
+                }
+                warn!(
+                    "Failed to re-initialize authentication manager: {}; will retry next cycle",
+                    e
+                );
+                return Err(e);
+            }
+        }
+    }
+    let generation = AUTH_MANAGER.generation.load(Ordering::Acquire);
     let token = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
-        .block_on(service_account_token())?;
+        .block_on(guard.as_ref().unwrap().get_token(SCOPES))?;
+    Ok((AccessToken::new(Some(token)), generation))
+}
 
-    Ok(AccessToken::new(Some(token)))
+/// Resets the `AuthenticationManager` so the next `get_token()` call re-reads
+/// credentials from disk. Only resets if `stale_generation` matches the current
+/// generation, preventing redundant resets from concurrent threads.
+fn reset_manager(stale_generation: u64) {
+    let mut guard = AUTH_MANAGER.inner.write().expect("auth manager lock poisoned");
+    let current = AUTH_MANAGER.generation.load(Ordering::Acquire);
+    if current != stale_generation {
+        debug!(
+            "Auth manager already reset by another thread (generation {} -> {})",
+            stale_generation, current
+        );
+        return;
+    }
+    warn!("Resetting GCS authentication manager to pick up fresh credentials");
+    *guard = None;
+    AUTH_MANAGER.generation.fetch_add(1, Ordering::Release);
 }
 
 /// A potentially active token. Use [`authenticate`][Self::authenticate] to add an `Authorization`
@@ -80,6 +144,10 @@ fn get_token() -> Result<AccessToken, gcp_auth::Error> {
 /// A `TokenStore` may be freely shared among threads; it synchronizes internally if needed.
 pub struct TokenStore {
     token: RwLock<Option<AccessToken>>,
+    /// The manager generation when the current cached token was obtained.
+    token_generation: RwLock<u64>,
+    /// Number of consecutive 401 failures observed. Used to trigger manager recreation.
+    consecutive_401s: AtomicU32,
 }
 
 impl TokenStore {
@@ -89,6 +157,31 @@ impl TokenStore {
     pub fn new() -> Self {
         Self {
             token: RwLock::new(None),
+            token_generation: RwLock::new(0),
+            consecutive_401s: AtomicU32::new(0),
+        }
+    }
+
+    /// Records a successful authenticated request, resetting any failure tracking.
+    pub fn record_auth_success(&self) {
+        if self.consecutive_401s.load(Ordering::Relaxed) > 0 {
+            self.consecutive_401s.store(0, Ordering::Relaxed);
+            info!("GCS authentication recovered successfully");
+        }
+    }
+
+    /// Records a 401 failure. If the failure count exceeds the threshold, triggers
+    /// recreation of the `AuthenticationManager` to pick up fresh credentials.
+    pub fn record_auth_failure(&self) {
+        let count = self.consecutive_401s.fetch_add(1, Ordering::Relaxed) + 1;
+        if count >= MAX_CONSECUTIVE_401S_BEFORE_RESET {
+            let gen = *self
+                .token_generation
+                .read()
+                .expect("generation lock poisoned");
+            reset_manager(gen);
+            self.consecutive_401s.store(0, Ordering::Relaxed);
+            self.invalidate();
         }
     }
 }
@@ -172,7 +265,13 @@ impl TokenStore {
         };
         // If we get here, we need a fresh token.
         match get_token() {
-            Ok(t) => *token = Some(t),
+            Ok((t, gen)) => {
+                *token = Some(t);
+                *self
+                    .token_generation
+                    .write()
+                    .expect("generation lock poisoned") = gen;
+            }
             Err(e) => {
                 warn!("GCS authentication failed: {}", e);
                 return rb;
